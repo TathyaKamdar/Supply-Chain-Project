@@ -1,5 +1,5 @@
-# =============================================================================
-# NHG Vehicle Routing Problem — Q1 Base Case (Vans Only)
+
+# NHG Vehicle Routing — Q1: Base Case (Vans Only)
 # =============================================================================
 
 import pandas as pd
@@ -7,37 +7,33 @@ import numpy as np
 from itertools import combinations
 import time
 
-# =============================================================================
+
 # STEP 1 — LOAD & CLEAN DATA
 # =============================================================================
 
-raw_orders = pd.read_excel("deliveries.xlsx",  sheet_name="OrderTable")
-raw_locs   = pd.read_excel("deliveries.xlsx",  sheet_name="LocationTable")
-raw_dist   = pd.read_excel("distances.xlsx",   sheet_name="Sheet1", header=None)
+raw_orders = pd.read_excel("deliveries.xlsx", sheet_name="OrderTable")
+raw_locs   = pd.read_excel("deliveries.xlsx", sheet_name="LocationTable")
+raw_dist   = pd.read_excel("distances.xlsx",  sheet_name="Sheet1", header=None)
 
-# ── Orders ────────────────────────────────────────────────────────────────────
-orders_df              = raw_orders[raw_orders["ORDERID"] != 0].copy()
-orders_df["CUBE"]      = orders_df["CUBE"].astype(int)
-orders_df["TOZIP"]     = orders_df["TOZIP"].astype(str).str.zfill(5)
-orders_df["FROMZIP"]   = orders_df["FROMZIP"].astype(str).str.zfill(5)
-orders_df["ST_REQ"]    = orders_df["ST required?"].str.lower() == "yes"
+# Orders — drop depot row, fix dtypes, pad ZIPs
+orders_df            = raw_orders[raw_orders["ORDERID"] != 0].copy()
+orders_df["CUBE"]    = orders_df["CUBE"].astype(int)
+orders_df["TOZIP"]   = orders_df["TOZIP"].astype(str).str.zfill(5)
+orders_df["FROMZIP"] = orders_df["FROMZIP"].astype(str).str.zfill(5)
 
-# ── Locations ─────────────────────────────────────────────────────────────────
+# Locations — drop garbage rows, normalize ZIP to 5-digit string
 locs_df            = raw_locs.dropna(subset=["ZIPID"]).copy()
 locs_df["ZIPID"]   = locs_df["ZIPID"].astype(int)
 locs_df["ZIP_STR"] = locs_df["ZIP"].astype(int).astype(str).str.zfill(5)
-locs_df            = locs_df.rename(columns={"Y": "LAT", "X": "LON"})
 
-# ── Lookups ───────────────────────────────────────────────────────────────────
-zip_to_id      = dict(zip(locs_df["ZIP_STR"], locs_df["ZIPID"]))
-zipid_to_coord = {int(r["ZIPID"]): (r["LAT"], r["LON"]) for _, r in locs_df.iterrows()}
-
+# ZIP → ZipID lookup
+zip_to_id = dict(zip(locs_df["ZIP_STR"], locs_df["ZIPID"]))
 DEPOT_ZIP = "01887"
-DEPOT_ID  = zip_to_id[DEPOT_ZIP]   # ZipID = 20
+DEPOT_ID  = zip_to_id[DEPOT_ZIP]   # ZipID 20
 
 assert not (set(orders_df["TOZIP"]) - set(zip_to_id)), "Unresolved TOZIPs"
 
-# ── Distance matrix ───────────────────────────────────────────────────────────
+# Distance matrix — two header rows, data from row 2 onward
 col_ids  = raw_dist.iloc[1, 2:].astype(int).tolist()
 row_ids  = raw_dist.iloc[2:, 1].astype(int).tolist()
 dist_arr = raw_dist.iloc[2:, 2:].astype(float).values
@@ -47,14 +43,13 @@ _idx     = {zipid: i for i, zipid in enumerate(col_ids)}
 def get_dist(a: int, b: int) -> float:
     return dist_arr[_idx[a], _idx[b]]
 
-# ── Orders dict + day grouping ────────────────────────────────────────────────
+# Master orders dict
 orders = {
     int(r["ORDERID"]): {
         "id":     int(r["ORDERID"]),
         "cube":   r["CUBE"],
         "day":    r["DayOfWeek"],
         "zip_id": zip_to_id[r["TOZIP"]],
-        "st_req": r["ST_REQ"],
     }
     for _, r in orders_df.iterrows()
 }
@@ -62,51 +57,35 @@ orders = {
 DAYS          = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 orders_by_day = {d: [oid for oid, o in orders.items() if o["day"] == d] for d in DAYS}
 
-# Q2 categories (defined here, used in Q2)
-ST_CAP  = 1400
-VAN_CAP = 3200
-st_required = [oid for oid, o in orders.items() if o["st_req"]]
-van_forced  = [oid for oid, o in orders.items() if not o["st_req"] and o["cube"] > ST_CAP]
-flexible    = [oid for oid, o in orders.items() if not o["st_req"] and o["cube"] <= ST_CAP]
+
+# =============================================================================
+# STEP 2 — CONSTANTS
+# =============================================================================
+
+VAN_CAP        = 3200
+SPEED_MPH      = 40.0
+UNLOAD_RATE    = 0.030     # min/ft³
+MIN_UNLOAD     = 30.0      # min
+MAX_DRIVE_MIN  = 660       # 11 hrs
+MAX_DUTY_MIN   = 840       # 14 hrs
+BREAK_MIN      = 600       # 10 hrs
+WINDOW_OPEN    = 480       # 8:00 am in minutes from midnight
+WINDOW_CLOSE   = 1080      # 6:00 pm in minutes from midnight
+WEEKS_PER_YEAR = 52
 
 
 # =============================================================================
-# STEP 2 — CONSTANTS & PARAMETERS
-# =============================================================================
-
-SPEED_MPH        = 40.0
-UNLOAD_RATE_VAN  = 0.030       # min/ft³
-UNLOAD_RATE_ST   = 0.043       # min/ft³
-MIN_UNLOAD       = 30.0        # min
-MAX_DRIVE_MIN    = 11 * 60     # 660 min
-MAX_DUTY_MIN     = 14 * 60     # 840 min
-BREAK_MIN        = 10 * 60     # 600 min
-WINDOW_OPEN      = 8  * 60     # 480 min (8:00 am)
-WINDOW_CLOSE     = 18 * 60     # 1080 min (6:00 pm)
-WEEKS_PER_YEAR   = 52
-
-
-# =============================================================================
-# STEP 3 — FEASIBILITY CHECKER (ALL CONSTRAINTS IN ONE FUNCTION)
+# STEP 3 — FEASIBILITY CHECKER
 # =============================================================================
 
 def _drive_time(a: int, b: int) -> float:
     return (get_dist(a, b) / SPEED_MPH) * 60.0
 
-def _unload_time(cube: int, vehicle: str) -> float:
-    rate = UNLOAD_RATE_VAN if vehicle == "van" else UNLOAD_RATE_ST
-    return max(MIN_UNLOAD, rate * cube)
+def _unload_time(cube: int) -> float:
+    return max(MIN_UNLOAD, UNLOAD_RATE * cube)
 
-def simulate_route(order_ids: list, vehicle: str = "van",
-                   allow_overnight: bool = True) -> dict:
-    """
-    Simulate full route timeline. Returns feasibility + stats.
-
-    Returns
-    -------
-    dict : feasible, total_miles, drive_min, duty_min, overnight,
-           end_time, reason (if infeasible), timeline
-    """
+def simulate_route(order_ids: list, allow_overnight: bool = True) -> dict:
+    # Returns: feasible, total_miles, drive_min, duty_min, overnight, end_time, timeline
     if not order_ids:
         return {"feasible": True, "total_miles": 0.0, "drive_min": 0.0,
                 "duty_min": 0.0, "overnight": False, "end_time": WINDOW_OPEN}
@@ -123,40 +102,37 @@ def simulate_route(order_ids: list, vehicle: str = "van",
     timeline  = [{"event": "DISPATCH", "clock": clock}]
 
     for oid in order_ids:
-        o        = orders[oid]
-        dest     = o["zip_id"]
-        leg_mi   = get_dist(loc, dest)
-        leg_min  = _drive_time(loc, dest)
-        ul_min   = _unload_time(o["cube"], vehicle)
-        d_left   = MAX_DRIVE_MIN - drive_acc
-        dy_left  = MAX_DUTY_MIN  - duty_acc
+        o         = orders[oid]
+        dest      = o["zip_id"]
+        leg_mi    = get_dist(loc, dest)
+        leg_min   = _drive_time(loc, dest)
+        ul_min    = _unload_time(o["cube"])
+        d_left    = MAX_DRIVE_MIN - drive_acc
+        dy_left   = MAX_DUTY_MIN  - duty_acc
         can_drive = leg_min <= d_left and leg_min <= dy_left
 
         if not can_drive:
             if not allow_overnight or overnight:
                 return {"feasible": False, "total_miles": miles,
-                        "reason": f"DOT limit at oid={oid}", "overnight": overnight}
+                        "reason": f"DOT limit oid={oid}", "overnight": overnight}
 
-            # Drive as far as legally possible then take break
-            driveable_min = min(d_left, dy_left)
-            driveable_mi  = (driveable_min / 60.0) * SPEED_MPH
-            clock        += driveable_min
-            miles        += driveable_mi
-            clock        += BREAK_MIN
-            drive_acc     = 0.0
-            duty_acc      = 0.0
-            overnight     = True
+            # Drive to legal limit then take 10hr break
+            drv_min  = min(d_left, dy_left)
+            drv_mi   = (drv_min / 60.0) * SPEED_MPH
+            clock   += drv_min + BREAK_MIN
+            miles   += drv_mi
+            drive_acc = duty_acc = 0.0
+            overnight = True
             timeline.append({"event": "OVERNIGHT BREAK", "clock": clock})
 
-            # Wait until 8 am next day if break ends before it
-            next_8am = WINDOW_OPEN + 24 * 60
-            if clock < next_8am:
-                clock = next_8am
+            # Wait until 8am next day if needed
+            if clock < WINDOW_OPEN + 24 * 60:
+                clock = WINDOW_OPEN + 24 * 60
 
-            # Drive remaining leg distance
-            rem_mi   = leg_mi - driveable_mi
-            rem_min  = (rem_mi / SPEED_MPH) * 60.0
-            clock   += rem_min
+            # Finish remaining leg to destination
+            rem_mi    = leg_mi - drv_mi
+            rem_min   = (rem_mi / SPEED_MPH) * 60.0
+            clock    += rem_min
             drive_acc += rem_min
             duty_acc  += rem_min
             miles    += rem_mi
@@ -164,7 +140,7 @@ def simulate_route(order_ids: list, vehicle: str = "van",
 
             if clock > WINDOW_CLOSE + 24 * 60:
                 return {"feasible": False, "total_miles": miles,
-                        "reason": f"oid={oid} after 6pm Day 2", "overnight": overnight}
+                        "reason": f"oid={oid} after 6pm Day2", "overnight": overnight}
 
             clock    += ul_min
             duty_acc += ul_min
@@ -181,28 +157,26 @@ def simulate_route(order_ids: list, vehicle: str = "van",
         day_close = WINDOW_CLOSE + (24 * 60 if overnight else 0)
         if clock > day_close:
             return {"feasible": False, "total_miles": miles,
-                    "reason": f"oid={oid} after 6pm ({clock/60:.2f}h)", "overnight": overnight}
+                    "reason": f"oid={oid} after 6pm", "overnight": overnight}
 
         clock    += ul_min
         duty_acc += ul_min
         timeline.append({"event": f"DELIVER oid={oid}", "clock": clock})
 
-    # Return leg
+    # Return leg to depot
     ret_mi  = get_dist(loc, DEPOT_ID)
     ret_min = _drive_time(loc, DEPOT_ID)
 
-    if (drive_acc + ret_min > MAX_DRIVE_MIN or duty_acc + ret_min > MAX_DUTY_MIN):
+    if drive_acc + ret_min > MAX_DRIVE_MIN or duty_acc + ret_min > MAX_DUTY_MIN:
         if not overnight and allow_overnight:
             clock    += BREAK_MIN
-            drive_acc = 0.0
-            duty_acc  = 0.0
+            drive_acc = duty_acc = 0.0
             overnight = True
-            next_8am  = WINDOW_OPEN + 24 * 60
-            if clock < next_8am:
-                clock = next_8am
+            if clock < WINDOW_OPEN + 24 * 60:
+                clock = WINDOW_OPEN + 24 * 60
         elif overnight:
             return {"feasible": False, "total_miles": miles,
-                    "reason": "DOT limit on return after overnight", "overnight": overnight}
+                    "reason": "DOT limit on return", "overnight": overnight}
 
     clock     += ret_min
     drive_acc += ret_min
@@ -210,23 +184,21 @@ def simulate_route(order_ids: list, vehicle: str = "van",
     miles     += ret_mi
     timeline.append({"event": "RETURN DEPOT", "clock": clock})
 
-    return {"feasible":    True,   "total_miles": miles,
-            "drive_min":   drive_acc, "duty_min":  duty_acc,
-            "overnight":   overnight, "end_time":  clock,
-            "timeline":    timeline}
+    return {"feasible":  True,      "total_miles": miles,
+            "drive_min": drive_acc, "duty_min":    duty_acc,
+            "overnight": overnight, "end_time":    clock,
+            "timeline":  timeline}
 
 
 # =============================================================================
 # STEP 4 — OBJECTIVE FUNCTION
 # =============================================================================
 
-def total_miles(routes: list, vehicle: str = "van") -> float:
-    """Sum of miles across all routes."""
-    return sum(simulate_route(r, vehicle)["total_miles"] for r in routes)
+def route_miles(route: list) -> float:
+    return simulate_route(route)["total_miles"]
 
-def route_miles(route: list, vehicle: str = "van") -> float:
-    """Miles for a single route."""
-    return simulate_route(route, vehicle)["total_miles"]
+def total_miles(routes: list) -> float:
+    return sum(route_miles(r) for r in routes)
 
 
 # =============================================================================
@@ -234,22 +206,14 @@ def route_miles(route: list, vehicle: str = "van") -> float:
 # =============================================================================
 
 def validate_table3() -> bool:
-    """
-    Reproduce Table 3 sample route from the case article.
-    Expected: dispatch 7:36am | return 5:45pm | drive 6.3h | duty 10.3h | cube 1245
-    """
     sample = [255, 209, 244, 67, 217, 180, 20, 201]
-    result = simulate_route(sample, vehicle="van", allow_overnight=False)
-
-    cube         = sum(orders[o]["cube"] for o in sample)
-    dispatch_min = WINDOW_OPEN - _drive_time(DEPOT_ID, orders[sample[0]]["zip_id"])
+    result = simulate_route(sample, allow_overnight=False)
+    cube   = sum(orders[o]["cube"] for o in sample)
+    disp   = WINDOW_OPEN - _drive_time(DEPOT_ID, orders[sample[0]]["zip_id"])
 
     def fmt(m):
-        total_h = int(m // 60) % 24
-        mi      = int(m % 60)
-        h12     = total_h % 12 or 12
-        ampm    = "am" if total_h < 12 else "pm"
-        return f"{h12}:{mi:02d} {ampm}"
+        h = int(m // 60) % 24; mi = int(m % 60)
+        return f"{h%12 or 12}:{mi:02d} {'am' if h<12 else 'pm'}"
 
     print("=" * 52)
     print("  TABLE 3 VALIDATION")
@@ -257,18 +221,17 @@ def validate_table3() -> bool:
     print(f"  {'Metric':<22} {'Result':>10} {'Expected':>10}")
     print(f"  {'-'*22} {'-'*10} {'-'*10}")
     print(f"  {'Cube (ft³)':<22} {cube:>10,} {'1,245':>10}")
-    print(f"  {'Dispatch':<22} {fmt(dispatch_min):>10} {'7:36 am':>10}")
+    print(f"  {'Dispatch':<22} {fmt(disp):>10} {'7:36 am':>10}")
     print(f"  {'Return':<22} {fmt(result['end_time']):>10} {'5:45 pm':>10}")
     print(f"  {'Drive (hrs)':<22} {result['drive_min']/60:>10.2f} {'6.30':>10}")
     print(f"  {'Duty (hrs)':<22} {result['duty_min']/60:>10.2f} {'10.30':>10}")
 
-    passed = all([
-        cube == 1245,
-        abs(dispatch_min - (7 * 60 + 36)) < 2,
-        abs(result["drive_min"] / 60 - 6.3)  < 0.1,
-        abs(result["duty_min"]  / 60 - 10.3) < 0.1,
-        result["feasible"]
-    ])
+    passed = (cube == 1245 and
+              abs(disp - 456) < 2 and
+              abs(result["drive_min"] / 60 - 6.3)  < 0.1 and
+              abs(result["duty_min"]  / 60 - 10.3) < 0.1 and
+              result["feasible"])
+
     print(f"\n  {'✓ ALL CHECKS PASSED' if passed else '✗ CHECKS FAILED'}")
     print("=" * 52)
     return passed
@@ -278,12 +241,8 @@ def validate_table3() -> bool:
 # STEP 6 — NEAREST NEIGHBOR
 # =============================================================================
 
-def nearest_neighbor(day: str, vehicle: str = "van") -> list:
-    """
-    Greedy construction: always extend route to the nearest feasible store.
-    Returns list of routes (each route = ordered list of OrderIDs).
-    """
-    cap      = VAN_CAP if vehicle == "van" else ST_CAP
+def nearest_neighbor(day: str) -> list:
+    # Greedy: always extend to nearest feasible unserved store
     unserved = list(orders_by_day[day])
     routes   = []
 
@@ -293,33 +252,25 @@ def nearest_neighbor(day: str, vehicle: str = "van") -> list:
         loc   = DEPOT_ID
 
         while True:
-            best_oid  = None
-            best_dist = float("inf")
-
+            best_oid = best_d = None
             for oid in unserved:
                 o = orders[oid]
-                if cube + o["cube"] > cap:
+                if cube + o["cube"] > VAN_CAP:
                     continue
-                result = simulate_route(route + [oid], vehicle)
-                if not result["feasible"]:
+                if not simulate_route(route + [oid])["feasible"]:
                     continue
                 d = get_dist(loc, o["zip_id"])
-                if d < best_dist:
-                    best_dist = d
-                    best_oid  = oid
+                if best_d is None or d < best_d:
+                    best_d, best_oid = d, oid
 
             if best_oid is None:
                 break
-
             route.append(best_oid)
             cube += orders[best_oid]["cube"]
             loc   = orders[best_oid]["zip_id"]
             unserved.remove(best_oid)
 
-        if route:
-            routes.append(route)
-        elif unserved:
-            routes.append([unserved.pop(0)])   # force single-order route
+        routes.append(route) if route else routes.append([unserved.pop(0)])
 
     return routes
 
@@ -328,22 +279,14 @@ def nearest_neighbor(day: str, vehicle: str = "van") -> list:
 # STEP 7 — CLARKE-WRIGHT SAVINGS
 # =============================================================================
 
-def clarke_wright(day: str, vehicle: str = "van") -> list:
-    """
-    Parallel Clarke-Wright Savings.
-    s(i,j) = dist(depot,i) + dist(depot,j) - dist(i,j)
-    Returns list of routes.
-    """
-    cap      = VAN_CAP if vehicle == "van" else ST_CAP
-    day_oids = list(orders_by_day[day])
-
-    # One singleton route per order
+def clarke_wright(day: str) -> list:
+    # Parallel CW: s(i,j) = d(depot,i) + d(depot,j) - d(i,j), greedy merge
+    day_oids   = list(orders_by_day[day])
     routes     = [[oid] for oid in day_oids]
     route_cube = [orders[oid]["cube"] for oid in day_oids]
     route_of   = {oid: i for i, oid in enumerate(day_oids)}
 
-    # Both orientations (i→j and j→i) — single orientation misses
-    # 94% of valid merges due to tail/head mismatch after prior merges
+    # Both orientations prevents 94% tail/head merge misses
     savings = []
     for i, j in combinations(day_oids, 2):
         s = (get_dist(DEPOT_ID, orders[i]["zip_id"]) +
@@ -353,28 +296,22 @@ def clarke_wright(day: str, vehicle: str = "van") -> list:
         savings.append((s, j, i))
     savings.sort(key=lambda x: -x[0])
 
-    # Greedy merge
     for s_val, i_oid, j_oid in savings:
         if s_val <= 0:
             break
-
-        ri = route_of[i_oid]
-        rj = route_of[j_oid]
-
+        ri, rj = route_of[i_oid], route_of[j_oid]
         if ri == rj or routes[ri] is None or routes[rj] is None:
             continue
         if routes[ri][-1] != i_oid or routes[rj][0] != j_oid:
             continue
-        if route_cube[ri] + route_cube[rj] > cap:
+        if route_cube[ri] + route_cube[rj] > VAN_CAP:
             continue
-
         merged = routes[ri] + routes[rj]
-        if not simulate_route(merged, vehicle)["feasible"]:
+        if not simulate_route(merged)["feasible"]:
             continue
-
-        routes[ri]     = merged
-        route_cube[ri] = route_cube[ri] + route_cube[rj]
-        routes[rj]     = None
+        routes[ri] = merged
+        route_cube[ri] += route_cube[rj]
+        routes[rj] = None
         for oid in routes[ri]:
             route_of[oid] = ri
 
@@ -382,205 +319,153 @@ def clarke_wright(day: str, vehicle: str = "van") -> list:
 
 
 # =============================================================================
-# STEP 8 — 2-OPT IMPROVEMENT
+# STEP 8 — 2-OPT
 # =============================================================================
 
-def two_opt(route: list, vehicle: str = "van") -> list:
-    """
-    Reverse segments between all pairs of positions.
-    Accepts move only if it reduces miles AND remains feasible.
-    """
+def two_opt(route: list) -> list:
+    # Reverse segments between all pairs; accept only if feasible + shorter
     if len(route) < 3:
         return route
-
     best       = route[:]
-    best_miles = route_miles(best, vehicle)
+    best_mi    = route_miles(best)
     improved   = True
-
     while improved:
         improved = False
         for i in range(len(best) - 1):
             for j in range(i + 2, len(best)):
-                candidate = best[:i+1] + best[i+1:j+1][::-1] + best[j+1:]
-                result    = simulate_route(candidate, vehicle)
-                if result["feasible"] and result["total_miles"] < best_miles - 0.01:
-                    best       = candidate
-                    best_miles = result["total_miles"]
-                    improved   = True
+                cand   = best[:i+1] + best[i+1:j+1][::-1] + best[j+1:]
+                result = simulate_route(cand)
+                if result["feasible"] and result["total_miles"] < best_mi - 0.01:
+                    best, best_mi, improved = cand, result["total_miles"], True
                     break
             if improved:
                 break
-
     return best
 
 
 # =============================================================================
-# STEP 9 — OR-OPT IMPROVEMENT
+# STEP 9 — OR-OPT
 # =============================================================================
 
-def or_opt(routes: list, vehicle: str = "van") -> list:
-    """
-    Relocate single stops between routes to reduce total miles.
-    Tries every stop in every route at every insertion position.
-    """
+def or_opt(routes: list) -> list:
+    # Relocate single stops between routes to reduce total miles
     routes   = [r[:] for r in routes]
     improved = True
-
     while improved:
         improved = False
         for r1 in range(len(routes)):
             if not routes[r1]:
                 continue
             for pos in range(len(routes[r1])):
-                oid       = routes[r1][pos]
-                new_r1    = routes[r1][:pos] + routes[r1][pos+1:]
-                res_r1    = simulate_route(new_r1, vehicle)
-                miles_r1  = res_r1["total_miles"] if res_r1["feasible"] else float("inf")
-                cap       = VAN_CAP if vehicle == "van" else ST_CAP
+                oid    = routes[r1][pos]
+                new_r1 = routes[r1][:pos] + routes[r1][pos+1:]
 
                 for r2 in range(len(routes)):
                     if not routes[r2]:
                         continue
                     cube_r2 = sum(orders[o]["cube"] for o in routes[r2])
-                    if r1 != r2 and cube_r2 + orders[oid]["cube"] > cap:
+                    if r1 != r2 and cube_r2 + orders[oid]["cube"] > VAN_CAP:
                         continue
 
-                    base_r2 = route_miles(routes[r2], vehicle) if r1 != r2 else 0
-                    before  = route_miles(routes[r1], vehicle) + base_r2
+                    before = route_miles(routes[r1]) + (route_miles(routes[r2]) if r1 != r2 else 0)
 
                     for ins in range(len(routes[r2]) + 1):
                         if r1 == r2:
-                            candidate = new_r1[:ins] + [oid] + new_r1[ins:]
-                            res       = simulate_route(candidate, vehicle)
-                            if res["feasible"] and res["total_miles"] < route_miles(routes[r1], vehicle) - 0.01:
-                                routes[r1] = candidate
+                            cand = new_r1[:ins] + [oid] + new_r1[ins:]
+                            res  = simulate_route(cand)
+                            if res["feasible"] and res["total_miles"] < route_miles(routes[r1]) - 0.01:
+                                routes[r1] = cand
                                 improved   = True
                                 break
                         else:
                             new_r2 = routes[r2][:ins] + [oid] + routes[r2][ins:]
-                            res2   = simulate_route(new_r2, vehicle)
-                            if not res2["feasible"]:
-                                continue
-                            after = miles_r1 + res2["total_miles"]
-                            if after < before - 0.01:
-                                routes[r1] = new_r1
-                                routes[r2] = new_r2
-                                improved   = True
-                                break
-                    if improved:
-                        break
-                if improved:
-                    break
-            if improved:
-                break
+                            res1   = simulate_route(new_r1)
+                            res2   = simulate_route(new_r2)
+                            if res1["feasible"] and res2["feasible"]:
+                                if res1["total_miles"] + res2["total_miles"] < before - 0.01:
+                                    routes[r1] = new_r1
+                                    routes[r2] = new_r2
+                                    improved   = True
+                                    break
+                    if improved: break
+                if improved: break
+            if improved: break
 
     return [r for r in routes if r]
 
 
 # =============================================================================
-# STEP 10 — 3-OPT IMPROVEMENT
+# STEP 10 — 3-OPT
 # =============================================================================
 
-def three_opt(route: list, vehicle: str = "van") -> list:
-    """
-    Try all 3-edge removals and 8 reconnections per triple.
-    More powerful than 2-Opt but O(n³) per pass.
-    """
+def three_opt(route: list) -> list:
+    # Try all 3-edge removals (8 reconnections each); O(n³) per pass
     if len(route) < 5:
-        return two_opt(route, vehicle)
-
-    best       = route[:]
-    best_miles = route_miles(best, vehicle)
-    improved   = True
-
+        return two_opt(route)
+    best     = route[:]
+    best_mi  = route_miles(best)
+    improved = True
     while improved:
         improved = False
         n = len(best)
         for i in range(n - 2):
             for j in range(i + 1, n - 1):
                 for k in range(j + 1, n):
-                    # All 8 reconnections of 3 segments
-                    A, B = best[:i+1],  best[i+1:j+1]
+                    A, B = best[:i+1], best[i+1:j+1]
                     C, D = best[j+1:k+1], best[k+1:]
-
-                    candidates = [
-                        A + B + C + D,           # original
-                        A + B + C[::-1] + D,
-                        A + B[::-1] + C + D,
-                        A + B[::-1] + C[::-1] + D,
-                        A + C + B + D,
-                        A + C + B[::-1] + D,
-                        A + C[::-1] + B + D,
-                        A + C[::-1] + B[::-1] + D,
-                    ]
-
-                    for candidate in candidates[1:]:   # skip original
-                        result = simulate_route(candidate, vehicle)
-                        if result["feasible"] and result["total_miles"] < best_miles - 0.01:
-                            best       = candidate
-                            best_miles = result["total_miles"]
-                            improved   = True
+                    for cand in [A+B+C[::-1]+D, A+B[::-1]+C+D,
+                                 A+B[::-1]+C[::-1]+D, A+C+B+D,
+                                 A+C+B[::-1]+D, A+C[::-1]+B+D,
+                                 A+C[::-1]+B[::-1]+D]:
+                        res = simulate_route(cand)
+                        if res["feasible"] and res["total_miles"] < best_mi - 0.01:
+                            best, best_mi, improved = cand, res["total_miles"], True
                             break
-                    if improved:
-                        break
-                if improved:
-                    break
-            if improved:
-                break
-
+                    if improved: break
+                if improved: break
+            if improved: break
     return best
 
 
 # =============================================================================
-# STEP 11 — FULL PIPELINE + COMPARISON
+# STEP 11 — SOLVE DAY + FULL PIPELINE
 # =============================================================================
 
-def solve_day(day: str, vehicle: str = "van") -> dict:
-    """
-    Run all algorithms on one day. Returns best solution + comparison table.
-    """
+def solve_day(day: str) -> dict:
     results = {}
 
-    # ── Construction ──────────────────────────────────────────────────────────
+    # Construction
     t0 = time.time()
-    nn_routes  = nearest_neighbor(day, vehicle)
-    results["NN"] = {"routes": nn_routes, "miles": total_miles(nn_routes, vehicle),
-                     "time": time.time() - t0}
+    nn = nearest_neighbor(day)
+    results["NN"] = {"routes": nn, "miles": total_miles(nn), "time": time.time()-t0}
 
     t0 = time.time()
-    cw_routes  = clarke_wright(day, vehicle)
-    results["CW"] = {"routes": cw_routes, "miles": total_miles(cw_routes, vehicle),
-                     "time": time.time() - t0}
+    cw = clarke_wright(day)
+    results["CW"] = {"routes": cw, "miles": total_miles(cw), "time": time.time()-t0}
 
-    # ── 2-Opt improvement ─────────────────────────────────────────────────────
+    # 2-Opt
     t0 = time.time()
-    nn_2opt = [two_opt(r, vehicle) for r in nn_routes]
-    results["NN+2Opt"] = {"routes": nn_2opt, "miles": total_miles(nn_2opt, vehicle),
-                           "time": time.time() - t0}
+    nn_2opt = [two_opt(r) for r in nn]
+    results["NN+2Opt"] = {"routes": nn_2opt, "miles": total_miles(nn_2opt), "time": time.time()-t0}
 
     t0 = time.time()
-    cw_2opt = [two_opt(r, vehicle) for r in cw_routes]
-    results["CW+2Opt"] = {"routes": cw_2opt, "miles": total_miles(cw_2opt, vehicle),
-                           "time": time.time() - t0}
+    cw_2opt = [two_opt(r) for r in cw]
+    results["CW+2Opt"] = {"routes": cw_2opt, "miles": total_miles(cw_2opt), "time": time.time()-t0}
 
-    # ── Or-Opt improvement ────────────────────────────────────────────────────
+    # Or-Opt
     t0 = time.time()
-    nn_oropt = or_opt(nn_2opt, vehicle)
-    results["NN+2Opt+OrOpt"] = {"routes": nn_oropt, "miles": total_miles(nn_oropt, vehicle),
-                                 "time": time.time() - t0}
+    nn_oropt = or_opt(nn_2opt)
+    results["NN+2Opt+OrOpt"] = {"routes": nn_oropt, "miles": total_miles(nn_oropt), "time": time.time()-t0}
 
     t0 = time.time()
-    cw_oropt = or_opt(cw_2opt, vehicle)
-    results["CW+2Opt+OrOpt"] = {"routes": cw_oropt, "miles": total_miles(cw_oropt, vehicle),
-                                 "time": time.time() - t0}
+    cw_oropt = or_opt(cw_2opt)
+    results["CW+2Opt+OrOpt"] = {"routes": cw_oropt, "miles": total_miles(cw_oropt), "time": time.time()-t0}
 
-    # ── 3-Opt improvement ─────────────────────────────────────────────────────
+    # 3-Opt
     t0 = time.time()
-    cw_3opt = [three_opt(r, vehicle) for r in cw_routes]
-    results["CW+3Opt"] = {"routes": cw_3opt, "miles": total_miles(cw_3opt, vehicle),
-                           "time": time.time() - t0}
+    cw_3opt = [three_opt(r) for r in cw]
+    results["CW+3Opt"] = {"routes": cw_3opt, "miles": total_miles(cw_3opt), "time": time.time()-t0}
 
-    # ── Best solution ─────────────────────────────────────────────────────────
     best_key    = min(results, key=lambda k: results[k]["miles"])
     best_routes = results[best_key]["routes"]
     best_miles  = results[best_key]["miles"]
@@ -590,9 +475,6 @@ def solve_day(day: str, vehicle: str = "van") -> dict:
 
 
 def solve_q1() -> dict:
-    """
-    Solve Q1 across all 5 days. Print per-day and overall comparison tables.
-    """
     print("\n" + "=" * 65)
     print("  Q1 — BASE CASE: VANS ONLY")
     print("=" * 65)
@@ -603,15 +485,13 @@ def solve_q1() -> dict:
 
     for day in DAYS:
         print(f"\n  Solving {day}...", end=" ", flush=True)
-        t_start   = time.time()
-        day_result = solve_day(day, vehicle="van")
-        elapsed   = time.time() - t_start
-        print(f"done ({elapsed:.1f}s)")
+        t0         = time.time()
+        day_result = solve_day(day)
+        print(f"done ({time.time()-t0:.1f}s)")
 
         all_best_routes[day] = day_result["best_routes"]
         weekly_miles        += day_result["best_miles"]
 
-        # Per-day algorithm comparison table
         print(f"\n  {day} — Algorithm Comparison")
         print(f"  {'Algorithm':<22} {'Routes':>7} {'Miles':>10} {'Time(s)':>9}")
         print(f"  {'-'*22} {'-'*7} {'-'*10} {'-'*9}")
@@ -620,15 +500,12 @@ def solve_q1() -> dict:
             print(f"  {algo:<22} {len(res['routes']):>7} {res['miles']:>10.1f} "
                   f"{res['time']:>9.2f}{marker}")
 
-        day_summary.append({
-            "day":    day,
-            "orders": len(orders_by_day[day]),
-            "routes": len(day_result["best_routes"]),
-            "miles":  day_result["best_miles"],
-            "best":   day_result["best_key"]
-        })
+        day_summary.append({"day":    day,
+                             "orders": len(orders_by_day[day]),
+                             "routes": len(day_result["best_routes"]),
+                             "miles":  day_result["best_miles"],
+                             "best":   day_result["best_key"]})
 
-    # ── Weekly + Annual summary ───────────────────────────────────────────────
     annual_miles = weekly_miles * WEEKS_PER_YEAR
 
     print("\n" + "=" * 65)
@@ -642,20 +519,17 @@ def solve_q1() -> dict:
     print(f"  {'─'*6} {'─'*7} {'─'*7} {'─'*10}")
     print(f"  {'TOTAL':<6} {'261':>7} "
           f"{sum(s['routes'] for s in day_summary):>7} {weekly_miles:>10.1f}")
-
     print(f"\n  Weekly Miles  : {weekly_miles:>10,.1f}")
     print(f"  Annual Miles  : {annual_miles:>10,.1f}  (× {WEEKS_PER_YEAR} weeks)")
 
-    # ── Resource requirements ─────────────────────────────────────────────────
     drivers, vehicles, sleepers = compute_resources(all_best_routes)
-
     print(f"\n  RESOURCE REQUIREMENTS")
     print(f"  {'Metric':<25} {'Count':>8}")
     print(f"  {'-'*25} {'-'*8}")
     print(f"  {'Min Drivers':<25} {drivers:>8}")
     print(f"  {'Min Vehicles':<25} {vehicles:>8}")
-    print(f"  {'Sleeper Cabs Needed':<25} {sleepers:>8}")
-    print(f"  {'Day Cabs Needed':<25} {max(0, vehicles-sleepers):>8}")
+    print(f"  {'Sleeper Cabs':<25} {sleepers:>8}")
+    print(f"  {'Day Cabs':<25} {max(0, vehicles-sleepers):>8}")
     print("=" * 65)
 
     return {"routes": all_best_routes, "weekly_miles": weekly_miles,
@@ -666,54 +540,27 @@ def solve_q1() -> dict:
 # STEP 12 — RESOURCE REQUIREMENTS
 # =============================================================================
 
-def compute_resources(all_routes: dict, vehicle_type: str = "van") -> tuple:
-    """
-    Compute minimum drivers and vehicles using greedy bin-packing.
-    A driver needs BREAK_MIN rest between routes.
-    Returns (min_drivers, max_concurrent_vehicles, sleeper_cabs)
-
-    Overnight logic:
-    - end_time from simulate_route is already in same-day minutes
-    - Overnight routes physically end on day+1; add 24*60 to absolute end
-    - Sleeper cab needed only when break falls between first and last delivery
-      (not when overnight only on return leg — day cab suffices then)
-    """
+def compute_resources(all_routes: dict) -> tuple:
+    # Returns (min_drivers, max_concurrent_vehicles, sleeper_cabs)
     day_num = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4}
     events  = []
 
     for day, routes in all_routes.items():
         d = day_num[day]
         for route in routes:
-            result    = simulate_route(route, vehicle_type)
-            first_zip = orders[route[0]]["zip_id"]
-
-            # Absolute dispatch time (minutes from Mon 00:00)
+            result       = simulate_route(route)
+            first_zip    = orders[route[0]]["zip_id"]
             dispatch_abs = d * 24 * 60 + WINDOW_OPEN - _drive_time(DEPOT_ID, first_zip)
-
-            # end_time is minutes from midnight of dispatch day
-            # If overnight, the route physically ends on the next calendar day
-            end_abs = d * 24 * 60 + result["end_time"]
+            end_abs      = d * 24 * 60 + result["end_time"]
             if result["overnight"]:
                 end_abs += 24 * 60
-
-            # Sleeper cab needed only if break falls before last delivery
-            # i.e. overnight triggered mid-route (not just on return leg)
-            # Detect: last event before RETURN DEPOT in timeline is Day2 delivery
-            timeline   = result.get("timeline", [])
-            mid_route_overnight = any(
-                "Day2" in e["event"] for e in timeline
-            )
-
-            events.append({
-                "start":    dispatch_abs,
-                "end":      end_abs,
-                "overnight": result["overnight"],
-                "sleeper":   mid_route_overnight
-            })
+            # Sleeper only needed for mid-route overnight (not return-leg only)
+            sleeper = any("Day2" in e["event"] for e in result.get("timeline", []))
+            events.append({"start": dispatch_abs, "end": end_abs, "sleeper": sleeper})
 
     events.sort(key=lambda x: x["start"])
 
-    # Min drivers — greedy: assign route to first available driver
+    # Min drivers — greedy bin-packing by rest constraint
     driver_ends = []
     for e in events:
         assigned = False
@@ -725,24 +572,16 @@ def compute_resources(all_routes: dict, vehicle_type: str = "van") -> tuple:
         if not assigned:
             driver_ends.append(e["end"])
 
-    min_drivers = len(driver_ends)
-
-    # Max concurrent vehicles — sweep line over dispatch/return times
-    sweep = []
-    for e in events:
-        sweep.append((e["start"], +1))
-        sweep.append((e["end"],   -1))
+    # Max concurrent vehicles — sweep line
+    sweep = [(e["start"], +1) for e in events] + [(e["end"], -1) for e in events]
     sweep.sort()
     curr = max_v = 0
     for _, delta in sweep:
         curr += delta
         max_v = max(max_v, curr)
 
-    # Sleeper cabs: only routes with mid-route overnight break
-    sleepers  = sum(1 for e in events if e["sleeper"])
-    day_cabs  = max(0, max_v - sleepers)
-
-    return min_drivers, max_v, sleepers
+    sleepers = sum(1 for e in events if e["sleeper"])
+    return len(driver_ends), max_v, sleepers
 
 
 # =============================================================================
@@ -750,10 +589,7 @@ def compute_resources(all_routes: dict, vehicle_type: str = "van") -> tuple:
 # =============================================================================
 
 if __name__ == "__main__":
-    # Step 5 — validate before solving
     ok = validate_table3()
     if not ok:
         raise SystemExit("Validation failed — fix data pipeline before proceeding.")
-
-    # Solve Q1
     q1 = solve_q1()
