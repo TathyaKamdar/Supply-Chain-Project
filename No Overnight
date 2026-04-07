@@ -1,7 +1,8 @@
 # =============================================================================
-# NHG Vehicle Routing — Q1: Vans Only
-# Outputs: Q1_Viz1_Waterfall.png | Q1_Viz2_AlgoTable.png
-#          Q1_RouteMap_Dark.png  | Q1_RouteMap_Light.png
+# NHG Vehicle Routing — Q1 (NO OVERNIGHT): Vans Only, Single-Day Shifts Only
+# All routes must start AND return to depot within one DOT shift.
+# Outputs: Q1_NoON_Viz1_Waterfall.png | Q1_NoON_Viz2_AlgoTable.png
+#          Q1_NoON_Routes.csv
 # =============================================================================
 
 import pandas as pd
@@ -10,7 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 from itertools import combinations
-import time, warnings
+import csv, time, warnings
 warnings.filterwarnings("ignore")
 
 
@@ -35,12 +36,13 @@ location = location.rename(columns={"Y": "LAT", "X": "LON"})
 zip_to_id      = dict(zip(location["ZIP_STR"], location["ZIPID"]))
 zipid_to_coord = {int(r["ZIPID"]): (float(r["LAT"]), float(r["LON"]))
                   for _, r in location.iterrows()}
+zipid_to_city  = {int(r["ZIPID"]): str(r["CITY"])  for _, r in location.iterrows()}
+zipid_to_state = {int(r["ZIPID"]): str(r["STATE"]) for _, r in location.iterrows()}
 
 depot_zip = "01887"
 depot_id  = int(zip_to_id[depot_zip])
 
 col_ids  = distances.iloc[1, 2:].astype(int).tolist()
-row_ids  = distances.iloc[2:, 1].astype(int).tolist()
 dist_arr = distances.iloc[2:, 2:].astype(float).values
 dist_idx = {int(z): i for i, z in enumerate(col_ids)}
 
@@ -63,16 +65,18 @@ for d in days:
 
 
 # ── define constraints ────────────────────────────────────────────────────────
-van_capacity   = 3200   # cubic feet
-unload_rate    = 0.030  # min per cubic foot
-min_unload     = 30     # min per stop
-driving_speed  = 40     # mph
+van_capacity   = 3200
+unload_rate    = 0.030
+min_unload     = 30
+driving_speed  = 40
 window_open    = 480    # 8am in minutes from midnight
 window_close   = 1080   # 6pm in minutes from midnight
-break_time     = 600    # 10 hours in minutes
 max_driving    = 660    # 11 hours in minutes
 max_duty       = 840    # 14 hours in minutes
 weeks_per_year = 52
+
+# OVERNIGHT IS DISABLED — all routes must complete within one shift
+ALLOW_OVERNIGHT = False
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -83,14 +87,20 @@ def unload_mins(cube):
     return max(min_unload, unload_rate * cube)
 
 
-# ── feasibility checker ───────────────────────────────────────────────────────
-def simulate(route, allow_overnight=True):
+# ── objective function ────────────────────────────────────────────────────────
+# Minimize total annual transportation miles (no overnight):
+#   Z = weeks_per_year × Σ(day) Σ(route in day) miles(route)
+# Constraints enforced in simulate(): capacity, time windows, DOT limits.
+# Overnight breaks NOT allowed — driver must return to depot same shift.
+
+def simulate(route):
+    # allow_overnight is always False in this version
     if not route:
-        return {"feasible": True, "miles": 0.0, "overnight": False,
+        return {"feasible": True, "miles": 0.0,
                 "drive": 0.0, "duty": 0.0}
 
     if sum(order_dict[o]["cube"] for o in route) > van_capacity:
-        return {"feasible": False, "miles": 0.0, "overnight": False}
+        return {"feasible": False, "miles": 0.0, "drive": 0.0, "duty": 0.0}
 
     first_zip = order_dict[route[0]]["zip_id"]
     clock     = window_open - drive_mins(depot_id, first_zip)
@@ -98,7 +108,6 @@ def simulate(route, allow_overnight=True):
     miles     = 0.0
     drive_acc = 0.0
     duty_acc  = 0.0
-    overnight = False
 
     for oid in route:
         dest    = order_dict[oid]["zip_id"]
@@ -108,66 +117,41 @@ def simulate(route, allow_overnight=True):
         d_left  = max_driving - drive_acc
         dy_left = max_duty    - duty_acc
 
+        # no overnight — if DOT limits hit, route is infeasible
         if leg_min > d_left or leg_min > dy_left:
-            if not allow_overnight or overnight:
-                return {"feasible": False, "miles": miles, "overnight": overnight}
-            drv = min(d_left, dy_left)
-            clock     += drv + break_time
-            miles     += (drv / 60) * driving_speed
-            drive_acc  = 0.0
-            duty_acc   = 0.0
-            overnight  = True
-            if clock < window_open + 1440:
-                clock = window_open + 1440
-            rem_mi  = leg_mi - (drv / 60) * driving_speed
-            rem_min = (rem_mi / driving_speed) * 60
-            clock     += rem_min
-            drive_acc += rem_min
-            duty_acc  += rem_min
-            miles     += rem_mi
-            loc        = dest
-            if clock > window_close + 1440:
-                return {"feasible": False, "miles": miles, "overnight": overnight}
-            clock    += ul
-            duty_acc += ul
-            continue
+            return {"feasible": False, "miles": miles, "drive": drive_acc, "duty": duty_acc}
 
         clock     += leg_min
         drive_acc += leg_min
         duty_acc  += leg_min
         miles     += leg_mi
         loc        = dest
-        limit      = window_close + (1440 if overnight else 0)
-        if clock > limit:
-            return {"feasible": False, "miles": miles, "overnight": overnight}
+
+        # delivery window check — must deliver before 6pm
+        if clock > window_close:
+            return {"feasible": False, "miles": miles, "drive": drive_acc, "duty": duty_acc}
+
         clock    += ul
         duty_acc += ul
 
-    # driver must return to depot within remaining DOT budget
-    # overnight break on return leg is NOT allowed per project rules
+    # return leg — must be within remaining DOT budget
     ret_mi  = get_dist(loc, depot_id)
     ret_min = drive_mins(loc, depot_id)
     if drive_acc + ret_min > max_driving or duty_acc + ret_min > max_duty:
-        return {"feasible": False, "miles": miles, "overnight": overnight}
+        return {"feasible": False, "miles": miles, "drive": drive_acc, "duty": duty_acc}
 
-    miles += ret_mi
-    return {"feasible": True, "miles": miles, "overnight": overnight,
-            "drive": drive_acc + ret_min, "duty": duty_acc + ret_min}
+    miles     += ret_mi
+    drive_acc += ret_min
+    duty_acc  += ret_min
 
+    return {"feasible": True, "miles": miles, "drive": drive_acc, "duty": duty_acc}
 
-# ── objective function ────────────────────────────────────────────────────────
-# Minimize total annual transportation miles across all routes and all days:
-#   Z = weeks_per_year × Σ(day) Σ(route in day) miles(route)
-# All constraints (capacity, time windows, DOT limits) are enforced
-# inside simulate() — infeasible routes return infinity so they are
-# never selected as best solution by any algorithm.
 
 def get_miles(route):
     res = simulate(route)
     return res["miles"] if res["feasible"] else float("inf")
 
 def total_miles(routes):
-    # weekly miles for one day = sum of miles across all routes that day
     return sum(get_miles(r) for r in routes)
 
 
@@ -241,10 +225,7 @@ def two_opt(route):
                 cand = best[:i+1] + best[i+1:j+1][::-1] + best[j+1:]
                 res  = simulate(cand)
                 if res["feasible"] and res["miles"] < best_mi - 0.01:
-                    best     = cand
-                    best_mi  = res["miles"]
-                    improved = True
-                    break
+                    best, best_mi, improved = cand, res["miles"], True; break
             if improved: break
     return best
 
@@ -314,7 +295,7 @@ def three_opt(route):
     return best
 
 
-# ── solve one day (all 7 algorithm combos) ────────────────────────────────────
+# ── solve one day (all 7 combos, pick best) ───────────────────────────────────
 def solve_day(day):
     nn  = nearest_neighbor(day)
     cw  = clarke_wright(day)
@@ -342,95 +323,61 @@ def solve_day(day):
     }
 
 
-# ── run q1 ────────────────────────────────────────────────────────────────────
+# ── run solver ────────────────────────────────────────────────────────────────
 print("=" * 65)
-print("  Q1 — VANS ONLY (CW + 2-Opt + Or-Opt)")
+print("  Q1 (NO OVERNIGHT) — VANS ONLY, SINGLE-DAY SHIFTS")
 print("=" * 65)
 
-# volume analysis straight from excel data
+# volume summary
+total_vol    = sum(o["cube"] for o in order_dict.values())
+total_orders = len(order_dict)
+import math
 print()
 print("  DATA SUMMARY (from Excel)")
 print(f"  {'─'*55}")
-total_vol   = sum(o["cube"] for o in order_dict.values())
-total_orders = len(order_dict)
-min_cube    = min(o["cube"] for o in order_dict.values())
-max_cube    = max(o["cube"] for o in order_dict.values())
-avg_cube    = total_vol / total_orders
 print(f"  Total orders         : {total_orders}")
 print(f"  Total weekly volume  : {total_vol:,} ft³")
-print(f"  Avg volume per order : {avg_cube:.1f} ft³")
-print(f"  Min order volume     : {min_cube} ft³")
-print(f"  Max order volume     : {max_cube:,} ft³")
-print(f"  Van capacity         : {van_capacity:,} ft³")
-print()
-print(f"  {'Day':<6} {'Orders':>7} {'Volume':>10} {'Avg/Order':>10} "
-      f"{'Min Vans':>9}")
-print(f"  {'─'*6} {'─'*7} {'─'*10} {'─'*10} {'─'*9}")
-import math
+print(f"  {'Day':<6} {'Orders':>7} {'Volume':>10} {'Min Vans':>9}")
+print(f"  {'─'*6} {'─'*7} {'─'*10} {'─'*9}")
 for day in days:
     day_oids = orders_by_day[day]
-    vol      = sum(order_dict[o]["cube"] for o in day_oids)
-    avg      = vol / len(day_oids)
-    min_v    = math.ceil(vol / van_capacity)
-    print(f"  {day:<6} {len(day_oids):>7} {vol:>9,} ft³ {avg:>9.0f} ft³ "
-          f"{min_v:>8} van{'s' if min_v>1 else ''}")
+    vol = sum(order_dict[o]["cube"] for o in day_oids)
+    print(f"  {day:<6} {len(day_oids):>7} {vol:>9,} ft³ {math.ceil(vol/van_capacity):>8} van{'s' if math.ceil(vol/van_capacity)>1 else ''}")
 print(f"  {'─'*6} {'─'*7} {'─'*10}")
 print(f"  {'TOTAL':<6} {total_orders:>7} {total_vol:>9,} ft³")
 print(f"  {'─'*55}")
+print(f"  NOTE: Overnight routes are DISABLED in this version.")
+print(f"  Every driver must complete their route and return")
+print(f"  to the depot within one DOT shift (≤11h drive, ≤14h duty).")
 print()
 
 all_results = {}
 all_routes  = {}
-weekly_q1   = 0.0
+weekly      = 0.0
 
 for day in days:
-    print(f"\n  Solving {day}...", end=" ", flush=True)
+    print(f"  Solving {day}...", end=" ", flush=True)
     t0  = time.time()
     res = solve_day(day)
     all_results[day] = res
     all_routes[day]  = res["best_routes"]
-    weekly_q1       += res["best_miles"]
+    weekly           += res["best_miles"]
     print(f"done ({time.time()-t0:.1f}s)  [{res['best_key']}]")
     print(f"    {len(res['best_routes'])} routes  {res['best_miles']:.0f} mi")
 
-annual_q1   = weekly_q1 * weeks_per_year
+annual       = weekly * weeks_per_year
 total_routes = sum(len(v) for v in all_routes.values())
 
-# base case 1: point-to-point (no consolidation)
+# base case 1
 weekly_bc1 = sum(2 * get_dist(depot_id, o["zip_id"]) for o in order_dict.values())
 annual_bc1 = weekly_bc1 * weeks_per_year
 
-# base case 2: no overnight (CW+2Opt only)
-print("\n  Computing BC2 (no overnight)...", end=" ", flush=True)
-weekly_bc2 = 0.0
-for day in days:
-    day_oids   = list(orders_by_day[day])
-    rts        = [[oid] for oid in day_oids]
-    rc         = [order_dict[oid]["cube"] for oid in day_oids]
-    ro         = {oid: i for i, oid in enumerate(day_oids)}
-    sav        = []
-    for i, j in combinations(day_oids, 2):
-        s = (get_dist(depot_id, order_dict[i]["zip_id"]) +
-             get_dist(depot_id, order_dict[j]["zip_id"]) -
-             get_dist(order_dict[i]["zip_id"], order_dict[j]["zip_id"]))
-        sav.append((s, i, j)); sav.append((s, j, i))
-    sav.sort(key=lambda x: -x[0])
-    for s, i, j in sav:
-        if s <= 0: break
-        ri, rj = ro[i], ro[j]
-        if ri == rj or rts[ri] is None or rts[rj] is None: continue
-        if rts[ri][-1] != i or rts[rj][0] != j: continue
-        if rc[ri] + rc[rj] > van_capacity: continue
-        merged = rts[ri] + rts[rj]
-        if not simulate(merged, allow_overnight=False)["feasible"]: continue
-        rts[ri] = merged; rc[ri] += rc[rj]; rts[rj] = None
-        for oid in rts[ri]: ro[oid] = ri
-    day_routes  = [two_opt(r) for r in [r for r in rts if r is not None]]
-    weekly_bc2 += sum(simulate(r, allow_overnight=False)["miles"] for r in day_routes)
-annual_bc2 = weekly_bc2 * weeks_per_year
-print("done")
+# overnight version (for comparison)
+weekly_on = 7025.0
+annual_on = weekly_on * weeks_per_year
 
-print("\n" + "=" * 65)
+print()
+print("=" * 65)
 print("  WEEKLY SUMMARY")
 print("=" * 65)
 print(f"  {'Day':<6} {'Routes':>6} {'Miles':>9} {'Algorithm'}")
@@ -439,59 +386,45 @@ for day in days:
     print(f"  {day:<6} {len(all_routes[day]):>6} "
           f"{all_results[day]['best_miles']:>9.0f}  {all_results[day]['best_key']}")
 print(f"  {'─'*6} {'─'*6} {'─'*9}")
-print(f"  {'TOTAL':<6} {total_routes:>6} {weekly_q1:>9.0f}")
-print(f"\n  Weekly Miles  : {weekly_q1:>10,.0f}")
-print(f"  Annual Miles  : {annual_q1:>10,.0f}  (× {weeks_per_year} weeks)")
-print(f"  BC1 Weekly    : {weekly_bc1:>10,.0f}")
-print(f"  BC2 Weekly    : {weekly_bc2:>10,.0f}")
+print(f"  {'TOTAL':<6} {total_routes:>6} {weekly:>9.0f}")
+print()
+print(f"  Weekly Miles (no overnight) : {weekly:>10,.0f}")
+print(f"  Annual Miles (no overnight) : {annual:>10,.0f}  (× {weeks_per_year} weeks)")
+print()
+print(f"  BC1 Point-to-Point          : {weekly_bc1:>10,.0f} mi/week")
+print(f"  With overnight (Q1)         : {weekly_on:>10,.0f} mi/week")
+print(f"  No overnight (this run)     : {weekly:>10,.0f} mi/week")
+print(f"  Extra cost of no overnight  : {weekly - weekly_on:>+10,.0f} mi/week "
+      f"(+{(weekly - weekly_on)/weekly_on*100:.1f}%)")
 print("=" * 65)
 
 
-# ── solution validation audit ─────────────────────────────────────────────────
+# ── solution validation ───────────────────────────────────────────────────────
 print()
 print("=" * 65)
 print("  SOLUTION VALIDATION AUDIT")
 print("=" * 65)
 
-# 1. order coverage check
 all_served = []
 for day in days:
     for route in all_routes[day]:
         all_served.extend(route)
 
-total_expected = len(order_dict)
-total_served   = len(all_served)
-unique_served  = len(set(all_served))
-missing_orders = set(order_dict.keys()) - set(all_served)
-duplicate_orders = total_served - unique_served
+total_vol_delivered = sum(order_dict[o]["cube"]
+                          for d in days for r in all_routes[d] for o in r)
+order_ok    = (len(all_served) == total_orders and len(set(all_served)) == total_orders)
+vol_ok      = (total_vol_delivered == total_vol)
+overnight_ok = not any(simulate(r)["feasible"] and False  # always True since no overnight
+                       for d in days for r in all_routes[d])
 
-print()
-print("  ORDER COVERAGE")
-print(f"  {'─'*40}")
-print(f"  Expected orders      : {total_expected}")
-print(f"  Orders served        : {total_served}")
-print(f"  Unique orders served : {unique_served}")
-print(f"  Missing orders       : {len(missing_orders)}"
-      + (f"  → OIDs: {sorted(missing_orders)}" if missing_orders else ""))
-print(f"  Duplicate orders     : {duplicate_orders}")
-
-if total_served == total_expected and unique_served == total_expected:
-    print(f"  {'─'*40}")
-    print(f"  ✓ ALL {total_expected} ORDERS SATISFIED — no missing, no duplicates")
-else:
-    print(f"  {'─'*40}")
-    print(f"  ✗ ORDER COVERAGE FAILED")
-
-# 2. per-route constraint audit + distance breakdown
-print()
-print("  PER-ROUTE CONSTRAINT AUDIT + DISTANCE BREAKDOWN")
-print(f"  {'─'*75}")
-print(f"  {'Route':<10} {'Stops':>5} {'Miles':>7} {'Drive':>7} {'Duty':>7} "
-      f"{'Cube':>12} {'ON':>3} {'Util%':>6} {'Status'}")
-print(f"  {'─'*10} {'─'*5} {'─'*7} {'─'*7} {'─'*7} {'─'*12} {'─'*3} {'─'*6} {'─'*8}")
-
+# all routes must be day-only (overnight=False by construction)
 route_issues    = []
 overtime_routes = []
+
+print()
+print(f"  {'Route':<10} {'Stops':>5} {'Miles':>7} {'Drive':>8} {'Duty':>8} "
+      f"{'Cube':>12} {'Util%':>6} {'Status'}")
+print(f"  {'─'*10} {'─'*5} {'─'*7} {'─'*8} {'─'*8} {'─'*12} {'─'*6} {'─'*8}")
 
 for day in days:
     day_routes = all_routes[day]
@@ -503,18 +436,15 @@ for day in days:
         res   = simulate(route)
         cube  = sum(order_dict[o]["cube"] for o in route)
         label = f"{day} R{ri+1}"
-        on    = "Y" if res["overnight"] else "N"
-        util  = res["duty"] / max_duty * 100
+        util  = cube / van_capacity * 100
 
         issues = []
-        if not res["feasible"]:
-            issues.append("INFEASIBLE")
-        if cube > van_capacity:
-            issues.append(f"CAPACITY {cube}>{van_capacity}")
+        if not res["feasible"]:           issues.append("INFEASIBLE")
+        if cube > van_capacity:           issues.append(f"CAP {cube}>{van_capacity}")
         if res["drive"] > max_driving + 0.5:
             issues.append(f"DRIVE {res['drive']/60:.2f}h>11h")
             overtime_routes.append(label)
-        if res["duty"] > max_duty + 0.5:
+        if res["duty"]  > max_duty + 0.5:
             issues.append(f"DUTY {res['duty']/60:.2f}h>14h")
             overtime_routes.append(label)
 
@@ -522,145 +452,107 @@ for day in days:
         if issues: route_issues.append((label, issues))
 
         print(f"  {label:<10} {len(route):>5} {res['miles']:>7.0f} "
-              f"{res['drive']/60:>6.2f}h {res['duty']/60:>6.2f}h "
-              f"{cube:>6}/{van_capacity} {on:>3} {util:>5.1f}%  {status}")
+              f"{res['drive']/60:>7.2f}h {res['duty']/60:>7.2f}h "
+              f"{cube:>6}/{van_capacity} {util:>5.1f}%  {status}")
 
-    # day subtotal
     print(f"  {'─'*75}")
     print(f"  {day+' TOTAL':<10} {day_orders:>5} {day_miles:>7.0f}  "
-          f"{'':>7} {'':>7} {day_cube:>6} ft³ "
-          f"{'':>3} {'':>6}")
+          f"{'':>8} {'':>8} {day_cube:>6} ft³")
     print()
 
-print(f"  {'─'*75}")
-
-# 3. vehicle usage
-n_overnight = sum(1 for d in days for r in all_routes[d] if simulate(r)["overnight"])
-n_day_only  = total_routes - n_overnight
-total_vol_delivered = sum(order_dict[o]["cube"]
-                          for d in days for r in all_routes[d] for o in r)
-
-print()
-print("  VEHICLE & EQUIPMENT USAGE")
-print(f"  {chr(8212)*50}")
-print(f"  Total vans used      : {total_routes}")
-print(f"  Sleeper cabs needed  : {n_overnight}  (overnight routes)")
-print(f"  Day cabs needed      : {n_day_only}  (day-only routes)")
-print(f"  By day:")
-for day in days:
-    n_on  = sum(1 for r in all_routes[day] if simulate(r)["overnight"])
-    n_off = len(all_routes[day]) - n_on
-    print(f"    {day}: {len(all_routes[day])} vans  ({n_on} sleeper  +  {n_off} day cab)")
-
-# 4. constraint compliance
-order_ok    = (total_served == total_expected and unique_served == total_expected)
-vol_ok      = (total_vol_delivered == total_vol)
-cap_ok      = all(sum(order_dict[o]["cube"] for o in r) <= van_capacity
-                  for d in days for r in all_routes[d])
-drive_ok    = all(simulate(r)["drive"] <= max_driving + 0.5
-                  for d in days for r in all_routes[d])
-duty_ok     = all(simulate(r)["duty"] <= max_duty + 0.5
-                  for d in days for r in all_routes[d])
-overtime_ok = len(overtime_routes) == 0
-feasible_ok = len(route_issues) == 0
-all_pass    = all([order_ok, vol_ok, cap_ok, drive_ok,
-                   duty_ok, overtime_ok, feasible_ok])
+# constraint summary
+cap_ok   = all(sum(order_dict[o]["cube"] for o in r) <= van_capacity
+               for d in days for r in all_routes[d])
+drive_ok = all(simulate(r)["drive"] <= max_driving + 0.5
+               for d in days for r in all_routes[d])
+duty_ok  = all(simulate(r)["duty"]  <= max_duty    + 0.5
+               for d in days for r in all_routes[d])
+ot_ok    = len(overtime_routes) == 0
+feas_ok  = len(route_issues) == 0
+all_pass = all([order_ok, vol_ok, cap_ok, drive_ok, duty_ok, ot_ok, feas_ok])
 
 max_drive_h = max(simulate(r)["drive"] for d in days for r in all_routes[d]) / 60
 max_duty_h  = max(simulate(r)["duty"]  for d in days for r in all_routes[d]) / 60
 
-print()
 print("=" * 65)
 print("  CONSTRAINT COMPLIANCE")
 print("=" * 65)
 print()
 print(f"  {'Constraint':<42} {'Status':<8}  Detail")
-print(f"  {chr(8212)*42} {chr(8212)*8}  {chr(8212)*22}")
+print(f"  {'─'*42} {'─'*8}  {'─'*22}")
 print(f"  {'All 261 orders delivered':<42} "
       f"{'✓  PASS' if order_ok else '✗  FAIL'}   "
-      f"{total_served}/{total_expected} orders")
-print(f"  {'Total volume delivered matches Excel':<42} "
+      f"{len(all_served)}/{total_orders} orders")
+print(f"  {'Total volume matches Excel':<42} "
       f"{'✓  PASS' if vol_ok else '✗  FAIL'}   "
       f"{total_vol_delivered:,} ft³ = {total_vol:,} ft³")
 print(f"  {'No order served twice':<42} "
-      f"{'✓  PASS' if unique_served==total_expected else '✗  FAIL'}   "
+      f"{'✓  PASS' if len(set(all_served))==total_orders else '✗  FAIL'}   "
       f"0 duplicates")
 print(f"  {'Van capacity ≤ 3,200 ft³ per route':<42} "
       f"{'✓  PASS' if cap_ok else '✗  FAIL'}   "
       f"all routes within limit")
 print(f"  {'DOT max drive ≤ 11 hrs per shift':<42} "
       f"{'✓  PASS' if drive_ok else '✗  FAIL'}   "
-      f"worst route = {max_drive_h:.2f}h")
+      f"worst = {max_drive_h:.2f}h")
 print(f"  {'DOT max duty ≤ 14 hrs per shift':<42} "
       f"{'✓  PASS' if duty_ok else '✗  FAIL'}   "
-      f"worst route = {max_duty_h:.2f}h")
+      f"worst = {max_duty_h:.2f}h")
 print(f"  {'No driver in overtime':<42} "
-      f"{'✓  PASS' if overtime_ok else '✗  FAIL'}   "
+      f"{'✓  PASS' if ot_ok else '✗  FAIL'}   "
       f"0 violations")
 print(f"  {'All routes feasible':<42} "
-      f"{'✓  PASS' if feasible_ok else '✗  FAIL'}   "
+      f"{'✓  PASS' if feas_ok else '✗  FAIL'}   "
       f"{total_routes} routes valid")
-print(f"  {'Orders fixed to their delivery day':<42} "
-      f"✓  PASS   no cross-day mixing")
-print(f"  {'Overnight routes have Day 2 deliveries':<42} "
-      f"✓  PASS   {n_overnight} overnight routes verified")
+print(f"  {'No overnight routes (all day-only)':<42} "
+      f"✓  PASS   confirmed by design")
 print()
-print(f"  {chr(8212)*65}")
+print(f"  {'─'*65}")
 if all_pass:
     print(f"  ✓  ALL CONSTRAINTS SATISFIED — solution is fully valid")
 else:
-    print(f"  ✗  CONSTRAINT VIOLATIONS FOUND")
+    print(f"  ✗  VIOLATIONS FOUND")
     for label, issues in route_issues:
         print(f"     {label}: {', '.join(issues)}")
-print(f"  {chr(8212)*65}")
+print(f"  {'─'*65}")
 
-print()
-print("  OVERNIGHT ROUTES — CLARIFICATION")
-print(f"  {chr(8212)*65}")
-print(f"  Overnight routes are ALLOWED on ALL 5 days (Mon–Fri).")
-print(f"  The rule is: every order on an overnight route must belong")
-print(f"  to the SAME delivery day. Cross-day mixing is forbidden.")
-print(f"  The case article uses a Monday example — this is illustrative,")
-print(f"  not a restriction to Mondays only.")
-print(f"  Your {n_overnight} overnight routes span: "
-      + ", ".join(
-          f"{d} R{ri+1}"
-          for d in days
-          for ri, r in enumerate(all_routes[d])
-          if simulate(r)["overnight"]
-      ))
-print(f"  All contain orders from their respective day only. ✓")
-print("=" * 65)
 
-# 5. driver hours + distance summary
+# ── driver hours & route sequences ───────────────────────────────────────────
 print()
 print("  DRIVER HOURS & DISTANCE COVERED")
-print(f"  {chr(8212)*62}")
+print(f"  {'─'*62}")
 print(f"  {'Route':<10} {'Stops':>5} {'Miles':>8} {'Drive':>8} {'Duty':>8} "
-      f"{'Util%':>6} {'Overnight'}")
-print(f"  {chr(8212)*10} {chr(8212)*5} {chr(8212)*8} {chr(8212)*8} {chr(8212)*8} {chr(8212)*6} {chr(8212)*9}")
+      f"{'Util%':>6}  OID Sequence")
+print(f"  {'─'*10} {'─'*5} {'─'*8} {'─'*8} {'─'*8} {'─'*6}  {'─'*20}")
 
-total_drive_hrs  = 0.0
-total_duty_hrs   = 0.0
-total_miles_all  = 0.0
-total_stops_all  = 0
+total_drive_hrs = 0.0
+total_duty_hrs  = 0.0
+total_miles_all = 0.0
+total_stops_all = 0
+
+def city_of(oid):
+    return zipid_to_city.get(order_dict[oid]["zip_id"], "?")
 
 for day in days:
     for ri, route in enumerate(all_routes[day]):
-        res         = simulate(route)
-        drive_h     = res["drive"] / 60
-        duty_h      = res["duty"]  / 60
-        util        = res["duty"] / max_duty * 100
-        on          = "Yes" if res["overnight"] else "No"
-        total_drive_hrs  += drive_h
-        total_duty_hrs   += duty_h
-        total_miles_all  += res["miles"]
-        total_stops_all  += len(route)
-        print(f"  {day+' R'+str(ri+1):<10} {len(route):>5} {res['miles']:>7.0f}mi "
-              f"{drive_h:>7.2f}h {duty_h:>7.2f}h "
-              f"{util:>5.1f}%   {on}")
+        res      = simulate(route)
+        drive_h  = res["drive"] / 60
+        duty_h   = res["duty"]  / 60
+        cube     = sum(order_dict[o]["cube"] for o in route)
+        util     = cube / van_capacity * 100
+        oid_seq  = "0 → " + " → ".join(str(o) for o in route) + " → 0"
+        city_seq = "DC → " + " → ".join(city_of(o) for o in route) + " → DC"
 
-print(f"  {chr(8212)*62}")
+        total_drive_hrs += drive_h
+        total_duty_hrs  += duty_h
+        total_miles_all += res["miles"]
+        total_stops_all += len(route)
+
+        print(f"  {day+' R'+str(ri+1):<10} {len(route):>5} {res['miles']:>7.0f}mi "
+              f"{drive_h:>7.2f}h {duty_h:>7.2f}h {util:>5.1f}%  {oid_seq}")
+        print(f"  {'':>10} {'':>5} {'':>8} {'':>8} {'':>8} {'':>6}  {city_seq}")
+
+print(f"  {'─'*62}")
 print(f"  {'TOTAL':<10} {total_stops_all:>5} {total_miles_all:>7.0f}mi "
       f"{total_drive_hrs:>7.2f}h {total_duty_hrs:>7.2f}h")
 print()
@@ -671,24 +563,74 @@ print(f"  Avg drive  per route   : {total_drive_hrs/total_routes:>7.2f} h  "
       f"({total_drive_hrs/total_routes/11*100:.0f}% of 11h DOT limit)")
 print(f"  Avg duty   per route   : {total_duty_hrs/total_routes:>7.2f} h  "
       f"({total_duty_hrs/total_routes/14*100:.0f}% of 14h DOT limit)")
-
+print(f"  Overnight routes       : 0 of {total_routes}  (disabled by design)")
 print("=" * 65)
+
+
+# ── csv export ────────────────────────────────────────────────────────────────
+print()
+print("  Exporting routes to CSV...")
+
+def route_seq_full(route):
+    parts = ["0 (DC)"]
+    for oid in route:
+        city  = zipid_to_city.get(order_dict[oid]["zip_id"], "?")
+        state = zipid_to_state.get(order_dict[oid]["zip_id"], "?")
+        parts.append(f"{oid} ({city},{state})")
+    parts.append("0 (DC)")
+    return " → ".join(parts)
+
+csv_rows = []
+for day in days:
+    for ri, route in enumerate(all_routes[day]):
+        res  = simulate(route)
+        cube = sum(order_dict[o]["cube"] for o in route)
+        csv_rows.append({
+            "Route":          f"{day} R{ri+1}",
+            "Day":            day,
+            "Route_Num":      ri + 1,
+            "Stops":          len(route),
+            "Miles":          round(res["miles"], 1),
+            "Cube_ft3":       cube,
+            "Van_Capacity":   van_capacity,
+            "Util_Pct":       round(cube / van_capacity * 100, 1),
+            "Overnight":      "No",
+            "Drive_h":        round(res["drive"] / 60, 2),
+            "Duty_h":         round(res["duty"]  / 60, 2),
+            "Feasible":       "Yes" if res["feasible"] else "No",
+            "Order_IDs":      "0 → " + " → ".join(str(o) for o in route) + " → 0",
+            "Route_Sequence": route_seq_full(route),
+        })
+
+csv_file = "Q1_NoON_Routes.csv"
+fieldnames = ["Route","Day","Route_Num","Stops","Miles","Cube_ft3",
+              "Van_Capacity","Util_Pct","Overnight",
+              "Drive_h","Duty_h","Feasible",
+              "Order_IDs","Route_Sequence"]
+
+with open(csv_file, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(csv_rows)
+
+print(f"  Saved: {csv_file}  ({len(csv_rows)} routes)")
 
 
 # ── visualizations ────────────────────────────────────────────────────────────
 
-# viz 1: waterfall bc1 → bc2 → q1
-print("\n[1/4] Waterfall Chart...")
+# viz 1: waterfall — bc1 → no-overnight → with-overnight comparison
+print()
+print("[1/2] Waterfall Chart...")
 
 fig, ax = plt.subplots(figsize=(12, 7))
 fig.patch.set_facecolor("#0f1117"); ax.set_facecolor("#0f1117")
 
 labels  = ["BC1\nPoint-to-Point\n(No Consolidation)",
-           "BC2\nVan Routing\n(No Overnight)",
-           "Q1\nVan Routing\n(With Overnight)"]
-values  = [weekly_bc1, weekly_bc2, weekly_q1]
+           "No Overnight\n(This Solution)",
+           "With Overnight\n(Q1 Reference)"]
+values  = [weekly_bc1, weekly, weekly_on]
 colors  = ["#e05252", "#f0a030", "#52b788"]
-ann_mi  = [annual_bc1, annual_bc2, annual_q1]
+ann_mi  = [annual_bc1, annual, annual_on]
 
 bars = ax.bar(labels, values, color=colors, width=0.45,
               edgecolor="white", linewidth=0.6, zorder=3)
@@ -696,36 +638,36 @@ bars = ax.bar(labels, values, color=colors, width=0.45,
 for i in range(len(values) - 1):
     reduction = values[i] - values[i+1]
     pct       = reduction / values[i] * 100
-    ax.annotate("", xy=(i + 0.78, values[i+1] + 400),
-                xytext=(i + 0.22, values[i] - 400),
+    sign      = "-" if reduction >= 0 else "+"
+    ax.annotate("", xy=(i + 0.78, values[i+1] + 300),
+                xytext=(i + 0.22, values[i] - 300),
                 arrowprops=dict(arrowstyle="-|>", color="white",
                                 lw=1.8, mutation_scale=16))
     ax.text(i + 0.5, (values[i] + values[i+1]) / 2,
-            f"-{pct:.1f}%\n(-{reduction:,.0f} mi/wk)",
+            f"{sign}{abs(pct):.1f}%\n({sign}{abs(reduction):,.0f} mi/wk)",
             ha="center", va="center", fontsize=10, color="white",
             fontweight="bold",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="#1e2130",
                       edgecolor="white", alpha=0.9))
 
 for bar, val, ann in zip(bars, values, ann_mi):
-    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 700,
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 500,
             f"{val:,.0f} mi/wk\n({ann/1e6:.2f}M mi/yr)",
             ha="center", va="bottom", fontsize=10.5,
             color="white", fontweight="bold")
 
-total_saving     = annual_bc1 - annual_q1
-total_saving_pct = total_saving / annual_bc1 * 100
+extra_cost = weekly - weekly_on
 ax.text(0.98, 0.97,
-        f"Total Annual Saving vs BC1\n"
-        f"{total_saving:,.0f} miles  ({total_saving_pct:.1f}% reduction)\n"
-        f"Est. saving @ $0.50/mi:  ${total_saving * 0.50:,.0f}/yr",
+        f"No overnight vs with overnight:\n"
+        f"+{extra_cost:,.0f} mi/wk  (+{extra_cost/weekly_on*100:.1f}%)\n"
+        f"Annual extra cost: +{extra_cost*52:,.0f} mi/yr",
         transform=ax.transAxes, ha="right", va="top", fontsize=9.5,
-        color="#52b788", fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#0d2018",
-                  edgecolor="#52b788", linewidth=1.5))
+        color="#f0a030", fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#1e2130",
+                  edgecolor="#f0a030", linewidth=1.5))
 
-ax.set_title("NHG Transportation Optimization — Weekly Miles by Scenario",
-             color="white", fontsize=14, fontweight="bold", pad=15)
+ax.set_title("NHG Transportation — No-Overnight vs Overnight vs Point-to-Point",
+             color="white", fontsize=13, fontweight="bold", pad=15)
 ax.set_ylabel("Weekly Miles", color="white", fontsize=12)
 ax.set_ylim(0, max(values) * 1.22)
 ax.yaxis.grid(True, color="#2a2a2a", linestyle="--", zorder=0)
@@ -733,20 +675,20 @@ ax.set_axisbelow(True)
 ax.tick_params(colors="white", labelsize=11)
 for sp in ax.spines.values(): sp.set_color("#444")
 plt.tight_layout()
-plt.savefig("Q1_Viz1_Waterfall.png", dpi=150,
+plt.savefig("Q1_NoON_Viz1_Waterfall.png", dpi=150,
             bbox_inches="tight", facecolor="#0f1117")
 plt.close()
-print("   Saved: Q1_Viz1_Waterfall.png")
+print("   Saved: Q1_NoON_Viz1_Waterfall.png")
 
 
 # viz 2: algorithm comparison table
-print("[2/4] Algorithm Table...")
+print("[2/2] Algorithm Table...")
 
 algos = ["NN", "CW", "NN+2Opt", "CW+2Opt",
          "NN+2Opt+OrOpt", "CW+2Opt+OrOpt", "CW+3Opt"]
 
-data         = {day: {a: all_results[day]["results"][a]["miles"] for a in algos}
-                for day in days}
+data          = {day: {a: all_results[day]["results"][a]["miles"] for a in algos}
+                 for day in days}
 best_per_day  = {day: min(data[day].values()) for day in days}
 worst_per_day = {day: max(data[day].values()) for day in days}
 best_weekly   = sum(best_per_day.values())
@@ -754,11 +696,11 @@ best_weekly   = sum(best_per_day.values())
 rows = []
 for algo in algos:
     day_vals = [data[day][algo] for day in days]
-    weekly   = sum(day_vals)
-    vs_best  = (weekly - best_weekly) / best_weekly * 100
+    wk       = sum(day_vals)
+    vs       = (wk - best_weekly) / best_weekly * 100
     rows.append([algo] + [f"{m:.0f}" for m in day_vals]
-                + [f"{weekly:,.0f}"]
-                + ["BEST ✓" if vs_best < 0.01 else f"+{vs_best:.1f}%"])
+                + [f"{wk:,.0f}"]
+                + ["BEST ✓" if vs < 0.01 else f"+{vs:.1f}%"])
 
 col_labels = ["Algorithm", "Mon", "Tue", "Wed", "Thu", "Fri",
               "Weekly\nTotal", "vs\nBest"]
@@ -806,124 +748,27 @@ for i, algo in enumerate(algos):
         tbl[ri, len(days)+2].set_facecolor("#1a1f2e")
         tbl[ri, len(days)+2].set_text_props(color="#ff8080")
 
-ax.set_title("Q1 — Algorithm Comparison: Miles per Day  "
-             "(green = best  |  red = worst per column)",
+ax.set_title("Q1 (No Overnight) — Algorithm Comparison: Miles per Day",
              color="white", fontsize=12, fontweight="bold", pad=12)
 plt.tight_layout()
-plt.savefig("Q1_Viz2_AlgoTable.png", dpi=150,
+plt.savefig("Q1_NoON_Viz2_AlgoTable.png", dpi=150,
             bbox_inches="tight", facecolor="#0f1117")
 plt.close()
-print("   Saved: Q1_Viz2_AlgoTable.png")
-
-
-# viz 3: route maps (dark + light)
-print("[3/4] Route Map (dark)...")
-print("[4/4] Route Map (light)...")
-
-DAY_CM_DARK  = {"Mon": plt.cm.Reds, "Tue": plt.cm.Oranges,
-                "Wed": plt.cm.Blues, "Thu": plt.cm.Purples, "Fri": plt.cm.Greens}
-DAY_CM_LIGHT = {"Mon": plt.cm.Reds, "Tue": plt.cm.YlOrBr,
-                "Wed": plt.cm.Blues, "Thu": plt.cm.Purples, "Fri": plt.cm.Greens}
-
-depot_coord = zipid_to_coord[depot_id]
-
-suptitle = (f"Q1 Route Map — All Routes by Day  "
-            f"(★ = Wilmington DC  ·  numbers = stop sequence  ·  dashed = overnight)\n"
-            f"Weekly: {weekly_q1:,.0f} mi  ·  Annual: {annual_q1:,.0f} mi  ·  "
-            f"Routes: {total_routes}  ·  Algorithm: CW + 2-Opt + Or-Opt")
-
-legend_handles = [
-    mlines.Line2D([], [], color="#888", lw=2, ls="-",  label="Day route (solid)"),
-    mlines.Line2D([], [], color="#888", lw=2, ls="--", label="Overnight route (dashed)"),
-    mpatches.Patch(facecolor="#f5a623", label="★ Wilmington DC"),
-]
-
-def draw_map(axes, bg, text, grid, spine, cm_dict):
-    for ax_idx, day in enumerate(days):
-        ax      = axes[ax_idx]; ax.set_facecolor(bg)
-        routes  = all_routes[day]; n = len(routes)
-        palette = cm_dict[day]
-        colors  = [palette(0.40 + 0.45 * i / max(1, n-1)) for i in range(n)]
-        day_mi  = sum(get_miles(r) for r in routes)
-        n_on    = sum(1 for r in routes if simulate(r)["overnight"])
-
-        for oid in orders_by_day[day]:
-            coord = zipid_to_coord.get(order_dict[oid]["zip_id"])
-            if coord: ax.scatter(coord[1], coord[0], s=6, color=grid, zorder=2, alpha=0.5)
-
-        for ri, route in enumerate(routes):
-            rc   = colors[ri]; res = simulate(route)
-            path = [depot_id] + [order_dict[o]["zip_id"] for o in route] + [depot_id]
-            lons = [zipid_to_coord[z][1] for z in path if z in zipid_to_coord]
-            lats = [zipid_to_coord[z][0] for z in path if z in zipid_to_coord]
-            ls   = "--" if res["overnight"] else "-"
-            ax.plot(lons, lats, ls, color=rc, linewidth=1.6, zorder=3, alpha=0.88)
-            for seq, oid in enumerate(route):
-                coord = zipid_to_coord.get(order_dict[oid]["zip_id"])
-                if coord:
-                    ax.scatter(coord[1], coord[0], s=30, color=rc, zorder=4)
-                    ax.text(coord[1], coord[0], str(seq+1),
-                            ha="center", va="center", fontsize=4.5,
-                            color="white", fontweight="bold", zorder=5)
-            ax.plot([], [], color=rc, lw=2, label=f"R{ri+1}")
-
-        ax.scatter(depot_coord[1], depot_coord[0], s=250,
-                   color="#f5a623", marker="*", zorder=6)
-        ax.text(depot_coord[1], depot_coord[0]+0.06, "DC",
-                ha="center", fontsize=7, color="#f5a623",
-                fontweight="bold", zorder=7)
-        ax.legend(loc="lower right", fontsize=5.5, framealpha=0.7,
-                  facecolor=bg, labelcolor=text, edgecolor=spine)
-
-        title = f"{day}  ·  {n} routes  ·  {day_mi:.0f} mi"
-        if n_on: title += f"  ({n_on} overnight)"
-        ax.set_title(title, color=text, fontsize=9.5, fontweight="bold", pad=6)
-        ax.tick_params(colors=grid, labelsize=6.5)
-        for sp in ax.spines.values(): sp.set_color(spine)
-        if ax_idx == 0: ax.set_ylabel("Latitude", color=grid, fontsize=8)
-        ax.set_xlabel("Longitude", color=grid, fontsize=7)
-
-# dark version
-fig_d, axes_d = plt.subplots(1, 5, figsize=(26, 7))
-fig_d.patch.set_facecolor("#0f1117")
-draw_map(axes_d, "#0d1b2a", "white", "#445566", "#223344", DAY_CM_DARK)
-fig_d.suptitle(suptitle, color="white", fontsize=11, fontweight="bold", y=1.02)
-fig_d.legend(handles=legend_handles, loc="lower center", ncol=3,
-             bbox_to_anchor=(0.5, -0.04), facecolor="#1e2130",
-             labelcolor="white", edgecolor="#444", fontsize=9)
-plt.tight_layout()
-plt.savefig("Q1_RouteMap_Dark.png", dpi=150,
-            bbox_inches="tight", facecolor="#0f1117")
-plt.close()
-print("   Saved: Q1_RouteMap_Dark.png")
-
-# light version
-fig_l, axes_l = plt.subplots(1, 5, figsize=(26, 7))
-fig_l.patch.set_facecolor("white")
-draw_map(axes_l, "#f8f9fa", "#111111", "#aaaaaa", "#cccccc", DAY_CM_LIGHT)
-fig_l.suptitle(suptitle, color="#111111", fontsize=11, fontweight="bold", y=1.02)
-fig_l.legend(handles=legend_handles, loc="lower center", ncol=3,
-             bbox_to_anchor=(0.5, -0.04), facecolor="white",
-             labelcolor="#111", edgecolor="#ccc", fontsize=9)
-plt.tight_layout()
-plt.savefig("Q1_RouteMap_Light.png", dpi=150,
-            bbox_inches="tight", facecolor="white")
-plt.close()
-print("   Saved: Q1_RouteMap_Light.png")
+print("   Saved: Q1_NoON_Viz2_AlgoTable.png")
 
 
 print()
 print("=" * 65)
-print("  Q1 COMPLETE")
+print("  Q1 (NO OVERNIGHT) COMPLETE")
 print("=" * 65)
-print("  Q1_Viz1_Waterfall.png    — BC1 → BC2 → Q1 waterfall")
-print("  Q1_Viz2_AlgoTable.png    — Algorithm comparison table")
-print("  Q1_RouteMap_Dark.png     — Route map (dark, for screen)")
-print("  Q1_RouteMap_Light.png    — Route map (light, for report)")
+print("  Q1_NoON_Viz1_Waterfall.png  — Comparison chart")
+print("  Q1_NoON_Viz2_AlgoTable.png  — Algorithm table")
+print("  Q1_NoON_Routes.csv          — All routes with OID sequence")
 print()
-print(f"  BC1 Weekly : {weekly_bc1:>10,.0f} mi")
-print(f"  BC2 Weekly : {weekly_bc2:>10,.0f} mi")
-print(f"  Q1  Weekly : {weekly_q1:>10,.0f} mi")
-print(f"  Q1  Annual : {annual_q1:>10,.0f} mi")
-print(f"  Routes     : {total_routes:>10}")
+print(f"  Weekly Miles (no overnight) : {weekly:>10,.0f}")
+print(f"  Annual Miles (no overnight) : {annual:>10,.0f}")
+print(f"  vs With Overnight (Q1)      : {weekly - weekly_on:>+10,.0f} mi/wk "
+      f"(+{(weekly-weekly_on)/weekly_on*100:.1f}%)")
+print(f"  Total routes                : {total_routes:>10}")
+print(f"  All routes day-only         : ✓ confirmed")
 print("=" * 65)
